@@ -7,11 +7,11 @@ const PORT = process.env.PORT || 5000;
 
  app.use(cors());
 app.use(express.json());
-
+//changed pword 
  const db = mysql.createConnection({
   host: 'localhost',
   user: 'root',
-  password: 'DanL@NY2025',
+  password: '08817',
   database: 'sakila'
 });
 
@@ -239,8 +239,185 @@ app.get('/films', async (req, res) => {
     res.status(500).json({ error: 'An error occurred while fetching films.' });
   }
 });
+const rentFilm = (req, res) => { 
+  const { customerId, filmId } = req.body;
 
  
+  console.log('Received request to rent film:', { customerId, filmId });
+
+  
+  const availableCountQuery = `
+    SELECT 
+        i.inventory_id
+    FROM 
+        inventory i
+    JOIN 
+        film f ON i.film_id = f.film_id
+    WHERE 
+        f.film_id = ? 
+        AND i.inventory_id NOT IN (
+            SELECT inventory_id 
+            FROM rental 
+            WHERE return_date IS NULL
+        )
+    LIMIT 1;  -- Get just one available inventory ID
+`;
+
+  db.query(availableCountQuery, [filmId], (err, results) => {
+      if (err) {
+          console.error('Error checking available copies: ', err);
+          return res.status(500).json({ error: 'Error checking availability' });
+      }
+
+      console.log('Available copies query results:', results);
+
+      if (!results.length) {
+          return res.status(400).json({ error: 'Film is out of stock' });
+      }
+
+      const inventoryId = results[0].inventory_id;
+
+     
+      const existingRentalQuery = `
+          SELECT COUNT(*) AS rental_count 
+          FROM rental 
+          WHERE customer_id = ? AND inventory_id = ?;
+      `;
+
+      db.query(existingRentalQuery, [customerId, inventoryId], (err, results) => {
+          if (err) {
+              console.error('Error checking existing rentals: ', err);
+              return res.status(500).json({ error: 'Error checking existing rentals' });
+          }
+
+          const rentalCount = results[0].rental_count;
+
+          if (rentalCount > 0) {
+              return res.status(400).json({ error: 'Cannot rent the same film more than once' });
+          }
+
+          
+          const rentQuery = `
+              INSERT INTO rental (rental_date, inventory_id, customer_id, return_date, staff_id)
+              VALUES (NOW(), ?, ?, NULL, ?);
+          `;
+
+          const defaultStaffId = 1; 
+
+          db.query(rentQuery, [inventoryId, customerId, defaultStaffId], (err) => {
+              if (err) {
+                  console.error('Error inserting rental: ', err);
+                  return res.status(500).json({ error: 'Rental failed' });
+              }
+
+              res.json({ message: 'Film rented successfully' });
+          });
+      });
+  });
+};
+
+app.post('/api/rent', rentFilm);
+
+app.post('/api/customers', async (req, res) => {
+  const { first_name, last_name, email, address, address2, city, district, country, postal_code, phone } = req.body;
+
+  try {
+    const [emailResults] = await db.promise().query('SELECT * FROM customer WHERE email = ?', [email]);
+    if (emailResults.length > 0) {
+      return res.json({ success: false, message: 'Email is already in use' });
+    }
+
+    const [countryResults] = await db.promise().query('SELECT country_id FROM country WHERE country = ?', [country]);
+    let countryID;
+    if (countryResults.length > 0) {
+      countryID = countryResults[0].country_id;
+    } else {
+      const [insertedCountry] = await db.promise().query('INSERT INTO country (country, last_update) VALUES (?, NOW())', [country]);
+      countryID = insertedCountry.insertId; 
+    }
+
+    
+    const [cityResults] = await db.promise().query('SELECT city_id FROM city WHERE city = ?', [city]);
+    let cityID;
+    if (cityResults.length > 0) {
+      cityID = cityResults[0].city_id;
+    } else {
+      const [insertedCity] = await db.promise().query('INSERT INTO city (city, country_id, last_update) VALUES (?, ?, NOW())', [city, countryID]);
+      cityID = insertedCity.insertId; 
+    }
+
+    const [addressInsertResult] = await db.promise().query(
+      `INSERT INTO address (address, address2, district, city_id, postal_code, phone, location, last_update)
+       VALUES (?, ?, ?, ?, ?, ?, POINT(1, 1), NOW())`, 
+      [address, address2, district, cityID, postal_code, phone]
+    );
+
+    const addressID = addressInsertResult.insertId;
+
+    const [customerResult] = await db.promise().query(
+      `INSERT INTO customer (store_id, first_name, last_name, email, address_id, active, create_date)
+       VALUES (1, ?, ?, ?, ?, 1, NOW())`, 
+      [first_name, last_name, email, addressID]
+    );
+
+    res.json({ success: true, customer_id: customerResult.insertId });
+    
+  } catch (error) {
+    console.error('Error:', error.stack);
+    res.status(500).json({ error: 'An error occurred while processing your request' });
+  }
+});
+
+
+app.delete('/api/customers/:id', async (req, res) => {
+  const customerId = req.params.id;
+
+  try {
+      const [rentalResults] = await db.promise().query('SELECT COUNT(*) AS rental_count FROM rental WHERE customer_id = ?', [customerId]);
+      
+      if (rentalResults[0].rental_count > 0) {
+          return res.status(400).json({ success: false, message: 'Cannot delete customer with active rentals.' });
+      }
+
+      await db.promise().query('DELETE FROM customer WHERE customer_id = ?', [customerId]);
+      
+      res.json({ success: true });
+  } catch (error) {
+      console.error('Error deleting customer:', error.stack);
+      res.status(500).json({ error: 'An error occurred while deleting the customer' });
+  }
+});
+
+
+app.get('/api/customers', async (req, res) => {
+  const { page = 1, limit = 10, search = '' } = req.query;
+  const offset = (page - 1) * limit;
+
+  try {
+      const [results] = await connection.execute(
+          `SELECT * FROM customer
+          WHERE first_name LIKE ? OR last_name LIKE ?
+          LIMIT ? OFFSET ?`,
+          [`%${search}%`, `%${search}%`, limit, offset]
+      );
+      
+      const [countResult] = await connection.execute(
+          `SELECT COUNT(*) AS total FROM customer
+          WHERE first_name LIKE ? OR last_name LIKE ?`,
+          [`%${search}%`, `%${search}%`]
+      );
+
+      res.json({
+          results,
+          total: countResult[0].total,
+      });
+  } catch (error) {
+      console.error('Error fetching customers:', error);
+      res.status(500).send('Internal Server Error');
+  }
+});
+
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
